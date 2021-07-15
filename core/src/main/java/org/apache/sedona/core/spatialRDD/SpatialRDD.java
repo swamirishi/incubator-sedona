@@ -19,10 +19,21 @@
 
 package org.apache.sedona.core.spatialRDD;
 
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.commons.lang.NullArgumentException;
+import org.apache.hadoop.mapreduce.Job;
 import org.apache.log4j.Logger;
+import org.apache.parquet.avro.AvroParquetOutputFormat;
+import org.apache.parquet.example.data.Group;
+import org.apache.sedona.core.enums.GeometryType;
 import org.apache.sedona.core.enums.GridType;
 import org.apache.sedona.core.enums.IndexType;
+import org.apache.sedona.core.exceptions.SedonaException;
+import org.apache.sedona.core.exceptions.SedonaRuntimeException;
+import org.apache.sedona.core.geometryObjects.Circle;
+import org.apache.sedona.core.io.avro.schema.Field;
+import org.apache.sedona.core.io.avro.utils.AvroUtils;
 import org.apache.sedona.core.spatialPartitioning.FlatGridPartitioner;
 import org.apache.sedona.core.spatialPartitioning.KDBTree;
 import org.apache.sedona.core.spatialPartitioning.KDBTreePartitioner;
@@ -35,6 +46,7 @@ import org.apache.sedona.core.spatialRddTool.StatCalculator;
 import org.apache.sedona.core.utils.GeomUtils;
 import org.apache.sedona.core.utils.RDDSampleUtils;
 import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
@@ -43,12 +55,7 @@ import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.util.random.SamplingUtils;
 import org.geotools.geometry.jts.JTS;
 import org.geotools.referencing.CRS;
-import org.locationtech.jts.geom.Coordinate;
-import org.locationtech.jts.geom.Envelope;
-import org.locationtech.jts.geom.Geometry;
-import org.locationtech.jts.geom.GeometryFactory;
-import org.locationtech.jts.geom.LinearRing;
-import org.locationtech.jts.geom.Polygon;
+import org.locationtech.jts.geom.*;
 import org.locationtech.jts.index.SpatialIndex;
 import org.locationtech.jts.io.WKBWriter;
 import org.locationtech.jts.io.WKTWriter;
@@ -59,6 +66,7 @@ import org.wololo.geojson.Feature;
 import org.wololo.jts2geojson.GeoJSONWriter;
 import scala.Tuple2;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -66,6 +74,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.StreamSupport;
 
 // TODO: Auto-generated Javadoc
 
@@ -129,9 +138,24 @@ public class SpatialRDD<T extends Geometry>
      * The sample number.
      */
     private int sampleNumber = -1;
-
-    public int getSampleNumber()
-    {
+    /**
+     * Geometry Type Defaults to Geometry Collection
+     */
+    private GeometryType geometryType;
+    
+    public SpatialRDD() {
+        this(GeometryType.GEOMETRYCOLLECTION);
+    }
+    
+    public SpatialRDD(GeometryType geometryType) {
+        this.geometryType = geometryType;
+    }
+    
+    public GeometryType getGeometryType() {
+        return geometryType;
+    }
+    
+    public int getSampleNumber() {
         return sampleNumber;
     }
 
@@ -564,7 +588,45 @@ public class SpatialRDD<T extends Geometry>
             }
         }).saveAsTextFile(outputLocation);
     }
-
+    
+    public void saveAsParquet(JavaSparkContext sc,
+                              String geometryColumn,
+                              List<Field> userColumns,
+                              String outputLocation,
+                              String namespace,
+                              String name) throws SedonaException, IOException {
+        sc.hadoopConfiguration().setBoolean("parquet.enable.summary-metadata", false);
+        final Job job = Job.getInstance(sc.hadoopConfiguration());
+        GeometryType geometryType = this.getGeometryType();
+        Schema schema = AvroUtils.getSchema(geometryType, geometryColumn, userColumns,namespace,
+                                            name);
+//        ParquetOutputFormat.setWriteSupportClass(job, AvroWriteSupport.class);
+        AvroParquetOutputFormat.setSchema(job, schema);
+        this.rawSpatialRDD.mapPartitionsToPair(new PairFlatMapFunction<Iterator<T>, Void, GenericRecord>() {
+            @Override
+            public Iterator<Tuple2<Void, GenericRecord>> call(Iterator<T> iterator) throws Exception {
+                Schema schema = AvroUtils.getSchema(geometryType, geometryColumn, userColumns, namespace,
+                                                    name);
+                Iterable<T> recordIterable = () -> iterator;
+                try {
+                    return StreamSupport.stream(recordIterable.spliterator(), false).map(geometry -> {
+                        try {
+                            GenericRecord genericRecord =
+                                    AvroUtils.getRecord(geometry, geometryType, geometryColumn, schema);
+                            return new Tuple2<Void, GenericRecord>(null, genericRecord);
+                        } catch (SedonaException e) {
+                            throw new SedonaRuntimeException(e);
+                        }
+                    }).iterator();
+                } catch (SedonaRuntimeException e) {
+                    throw new SedonaException(e);
+                }
+            }
+        })
+                .saveAsNewAPIHadoopFile(outputLocation, Void.class, Group.class,
+                                        AvroParquetOutputFormat.class, job.getConfiguration());
+    }
+    
     /**
      * Save as geo JSON.
      *
